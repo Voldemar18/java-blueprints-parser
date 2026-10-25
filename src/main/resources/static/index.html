@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Java Blueprints</title>
+    <style>
+        :root{color-scheme:dark}
+        *{box-sizing:border-box}
+        body{margin:0;background:#0b1019;color:#e6edf7;font:14px system-ui,sans-serif}
+        header{padding:16px 20px;background:#131c2b;border-bottom:1px solid #29364a;
+        display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+        h1{font-size:20px;margin:0 auto 0 0}
+        h1 span{color:#ff8b38}
+        button,.upload{border:1px solid #42516a;border-radius:7px;padding:9px 12px;
+        background:#1d2b40;color:#edf3ff;cursor:pointer;font:inherit}
+        button:hover,.upload:hover{background:#2b3c57}
+        button:disabled{opacity:.45;cursor:not-allowed}
+        .primary{background:#a94b16;border-color:#ff8b38}
+        main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px}
+        .panel{background:#121b29;border:1px solid #29364a;border-radius:10px;
+        overflow:hidden;min-width:0}
+        .bar{padding:12px;border-bottom:1px solid #29364a;display:flex;
+        align-items:center;gap:10px;flex-wrap:wrap}
+        .bar h2{font-size:15px;margin:0 auto 0 0}
+        textarea{width:100%;height:420px;display:block;resize:vertical;border:0;
+        outline:none;padding:15px;background:#0d1522;color:#dce8ff;
+        font:13px/1.6 Consolas,monospace;tab-size:4}
+        #graph{height:420px;overflow:auto;background:
+        radial-gradient(#273447 1px,transparent 1px);background-size:18px 18px}
+        #graph svg{display:block}
+        #diagnosis{padding:16px;min-height:170px;white-space:pre-wrap;line-height:1.65}
+        .note{padding:10px 14px;color:#adbdd4;background:#182338;line-height:1.5}
+        #status{margin:0 14px 14px;padding:12px;border-radius:7px;background:#19273b;
+        white-space:pre-wrap}
+        #status.error{background:#4a2028;color:#ffd5d5}
+        #status.ok{background:#15382d;color:#baf5da}
+        .muted{color:#9cacc4;font-size:12px}
+        .metrics{display:flex;gap:12px;padding:12px;flex-wrap:wrap}
+        .metric{flex:1;background:#1b293e;padding:12px;border-radius:7px;min-width:150px}
+        .metric span{display:block;margin-top:5px;color:#ffb47f}
+        .wide{grid-column:1/-1}
+        @media(max-width:950px){main{grid-template-columns:1fr}}
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>Java <span>Blueprints</span></h1>
+    <label class="upload">
+        Загрузить .java
+        <input id="file" type="file" accept=".java" hidden>
+    </label>
+    <button id="demo">Пример</button>
+    <button id="parse">Построить граф</button>
+    <button id="analyze" class="primary">Анализировать ИИ</button>
+</header>
+
+<main>
+    <section class="panel">
+        <div class="bar">
+            <h2>Исходный Java-код</h2>
+            <span id="filename" class="muted">Demo.java</span>
+            <button id="downloadSource">Скачать</button>
+        </div>
+        <textarea id="source" spellcheck="false"
+                  aria-label="Исходный Java-код"></textarea>
+    </section>
+
+    <section class="panel">
+        <div class="bar">
+            <h2>Граф программы</h2>
+            <span class="muted">Нажмите узел → строка исходника</span>
+        </div>
+        <div id="graph"></div>
+        <div class="note">
+            Визуализация данных текущего парсера, не полноценный CFG.
+            Узлы расположены по порядку, рёбра — из ответа backend.
+        </div>
+    </section>
+
+    <section class="panel">
+        <div class="bar"><h2>Диагностика ИИ</h2></div>
+        <div class="metrics">
+            <div class="metric">Текущая сложность<span id="oldO">—</span></div>
+            <div class="metric">Предлагаемая сложность<span id="newO">—</span></div>
+        </div>
+        <div id="diagnosis">Нажмите «Анализировать ИИ».</div>
+    </section>
+
+    <section class="panel">
+        <div class="bar">
+            <h2>Предложение ИИ</h2>
+            <button id="downloadCandidate" disabled>Скачать</button>
+        </div>
+        <div class="note">
+            Поведение не проверено. Предложение не применяется автоматически.
+        </div>
+        <textarea id="candidate" readonly spellcheck="false"
+                  aria-label="Предложенный Java-код"></textarea>
+    </section>
+</main>
+
+<div id="status" role="status" aria-live="polite">Готово к работе.</div>
+
+<script>
+    'use strict';
+
+    const $ = id => document.getElementById(id);
+    const source = $('source');
+    let filename = 'Demo.java';
+    let busy = false;
+    let revision = 0;
+
+    const example = `public class Demo {
+        public static boolean hasDuplicates(int[] xs) {
+            for (int i = 0; i < xs.length; i++) {
+                for (int j = i + 1; j < xs.length; j++) {
+                    if (xs[i] == xs[j]) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }`;
+
+    function status(message, type = '') {
+        $('status').textContent = message;
+        $('status').className = type;
+    }
+
+    function setBusy(value) {
+        busy = value;
+        for (const id of ['parse', 'analyze', 'demo']) {
+            $(id).disabled = value;
+        }
+        $('file').disabled = value;
+    }
+
+    function invalidate() {
+        revision++;
+        $('candidate').value = '';
+        $('downloadCandidate').disabled = true;
+        $('diagnosis').textContent =
+            'Исходник изменён. Запустите анализ заново.';
+        $('oldO').textContent = '—';
+        $('newO').textContent = '—';
+        $('graph').replaceChildren();
+    }
+
+    source.addEventListener('input', invalidate);
+
+    $('demo').onclick = () => {
+        source.value = example;
+        filename = 'Demo.java';
+        $('filename').textContent = filename;
+        invalidate();
+        status('Пример загружен. Постройте граф или запустите анализ.');
+    };
+
+    $('file').onchange = async event => {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        try {
+            const text = await file.text();
+            source.value = text;
+            filename = file.name;
+            $('filename').textContent = filename;
+            invalidate();
+            status('Файл загружен: ' + filename);
+        } catch (error) {
+            status('Не удалось прочитать файл: ' + error.message, 'error');
+        } finally {
+            event.target.value = '';
+        }
+    };
+
+    async function api(url, options) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 120000);
+
+        try {
+            const response = await fetch(url, {
+                ...options,
+                signal: controller.signal
+            });
+
+            const text = await response.text();
+            let data;
+
+            try {
+                data = JSON.parse(text);
+            } catch {
+                if (!response.ok) {
+                    throw new Error(text.slice(0, 600) || `HTTP ${response.status}`);
+                }
+                throw new Error('Backend вернул не JSON.');
+            }
+
+            if (!response.ok) {
+                throw new Error(
+                    data.message || data.error || `HTTP ${response.status}`
+                );
+            }
+
+            return data;
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                throw new Error('Время ожидания превышено.');
+            }
+            throw error;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async function run(message, action) {
+        if (busy) return;
+        if (!source.value.trim()) {
+            status('Сначала загрузите или вставьте Java-код.', 'error');
+            return;
+        }
+
+        setBusy(true);
+        status(message);
+
+        try {
+            await action();
+        } catch (error) {
+            status(error.message, 'error');
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    $('parse').onclick = () => run('Строим граф…', async () => {
+        const code = source.value;
+        const currentRevision = revision;
+
+        const form = new FormData();
+        form.append(
+            'file',
+            new Blob([code], {type: 'text/plain;charset=utf-8'}),
+            filename
+        );
+
+        const graph = await api('/api/parse', {
+            method: 'POST',
+            body: form
+        });
+
+        if (currentRevision !== revision) {
+            status('Исходник изменился во время запроса. Постройте граф заново.');
+            return;
+        }
+
+        if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
+            throw new Error('Некорректный формат графа.');
+        }
+
+        renderGraph(graph);
+        status(
+            `Граф построен: ${graph.nodes.length} узлов, ` +
+            `${graph.edges.length} рёбер.`,
+            'ok'
+        );
+    });
+
+    $('analyze').onclick = () => run('ИИ анализирует код…', async () => {
+        const code = source.value;
+        const currentRevision = revision;
+
+        // Не оставляем старое предложение после неудачного нового запроса.
+        $('candidate').value = '';
+        $('downloadCandidate').disabled = true;
+        $('diagnosis').textContent = 'Анализ выполняется…';
+        $('oldO').textContent = '—';
+        $('newO').textContent = '—';
+
+        const data = await api('/api/analyze', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({code})
+        });
+
+        if (currentRevision !== revision) {
+            status('Исходник изменился. Результат отброшен, повторите анализ.');
+            return;
+        }
+
+        $('diagnosis').textContent =
+            `Диагноз: ${data.defect_found || '—'}\n\n` +
+            `Риск: ${data.risk || '—'}\n\n` +
+            `Рекомендация: ${data.recommendation || '—'}`;
+
+        $('oldO').textContent = data.current_big_o || '—';
+        $('newO').textContent = data.optimized_big_o || '—';
+
+        const candidate = typeof data.optimized_code === 'string'
+            ? data.optimized_code : '';
+
+        $('candidate').value = candidate;
+        $('downloadCandidate').disabled = !candidate.trim();
+
+        status(
+            candidate.trim()
+                ? 'Анализ готов. Предложение ИИ доступно, поведение не проверено.'
+                : 'Анализ готов. Изменённый код не предложен.',
+            'ok'
+        );
+    });
+
+    function goToLine(number) {
+        const line = Math.max(1, Number(number) || 1);
+        const lines = source.value.split('\n');
+        const index = Math.min(line - 1, lines.length - 1);
+
+        let start = 0;
+        for (let i = 0; i < index; i++) start += lines[i].length + 1;
+
+        source.focus();
+        source.setSelectionRange(start, start + lines[index].length);
+        source.scrollTop = Math.max(0, (index - 4) * 20.8);
+        status('Выбрана строка ' + (index + 1));
+    }
+
+    function svgElement(tag, attributes = {}, text) {
+        const element = document.createElementNS(
+            'http://www.w3.org/2000/svg', tag
+        );
+        for (const [key, value] of Object.entries(attributes)) {
+            element.setAttribute(key, String(value));
+        }
+        if (text !== undefined) element.textContent = text;
+        return element;
+    }
+
+    function renderGraph(graph) {
+        const container = $('graph');
+        container.replaceChildren();
+
+        if (!graph.nodes.length) {
+            container.textContent = 'Парсер не вернул узлов.';
+            return;
+        }
+
+        const positions = new Map();
+        const height = Math.max(420, graph.nodes.length * 100 + 30);
+        const svg = svgElement('svg', {
+            width: 680, height,
+            'aria-label': 'Граф Java-программы'
+        });
+
+        const defs = svgElement('defs');
+        const marker = svgElement('marker', {
+            id: 'arrow', viewBox: '0 0 10 10',
+            refX: 9, refY: 5,
+            markerWidth: 7, markerHeight: 7, orient: 'auto'
+        });
+        marker.append(svgElement('path', {
+            d: 'M 0 0 L 10 5 L 0 10 z', fill: '#8195b4'
+        }));
+        defs.append(marker);
+        svg.append(defs);
+
+        graph.nodes.forEach((node, index) => {
+            positions.set(node.id, {x: 60, y: 20 + index * 100});
+        });
+
+        graph.edges.forEach((edge, index) => {
+            const from = positions.get(edge.source);
+            const to = positions.get(edge.target);
+            if (!from || !to) return;
+
+            const lane = 560 + (index % 5) * 20;
+            const y1 = from.y + 35;
+            const y2 = to.y + 35;
+
+            svg.append(svgElement('path', {
+                d: `M 520 ${y1} C ${lane} ${y1}, ${lane} ${y2}, 520 ${y2}`,
+                fill: 'none', stroke: '#8195b4', 'stroke-width': 1.5,
+                'marker-end': 'url(#arrow)'
+            }));
+
+            svg.append(svgElement('text', {
+                x: lane - 30, y: (y1 + y2) / 2 - 4,
+                fill: '#a7b8d0', 'font-size': 10
+            }, edge.label || ''));
+        });
+
+        graph.nodes.forEach(node => {
+            const {x, y} = positions.get(node.id);
+            const group = svgElement('g', {
+                tabindex: 0, role: 'button', cursor: 'pointer',
+                'aria-label': `${node.type}, строка ${node.line}`
+            });
+
+            const color = node.type === 'if' ? '#a47725'
+                : String(node.type).startsWith('loop') ? '#7754c2'
+                : node.type === 'return' ? '#278b63' : '#3678b7';
+
+            group.append(svgElement('rect', {
+                x, y, width: 460, height: 70, rx: 9,
+                fill: '#18263a', stroke: color, 'stroke-width': 2
+            }));
+
+            group.append(svgElement('title', {}, String(node.text || '')));
+
+            group.append(svgElement('text', {
+                x: x + 12, y: y + 23, fill: '#ffbf91', 'font-size': 12
+            }, `${node.type} · строка ${node.line} · ${node.complexity || '—'}`));
+
+            const text = String(node.text || '').replace(/\s+/g, ' ');
+            group.append(svgElement('text', {
+                x: x + 12, y: y + 48,
+                fill: '#e3edff', 'font-size': 12
+            }, text.length > 57 ? text.slice(0, 54) + '…' : text));
+
+            group.addEventListener('click', () => goToLine(node.line));
+            group.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    goToLine(node.line);
+                }
+            });
+
+            svg.append(group);
+        });
+
+        container.append(svg);
+    }
+
+    function download(text, name) {
+        const url = URL.createObjectURL(
+            new Blob([text], {type: 'text/plain;charset=utf-8'})
+        );
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = name;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    $('downloadSource').onclick = () => download(source.value, filename);
+
+    // Оставляем исходное имя файла: public class требует соответствующего имени.
+    $('downloadCandidate').onclick = () => {
+        if ($('candidate').value.trim()) {
+            download($('candidate').value, filename);
+        }
+    };
+
+    source.value = example;
+</script>
+</body>
+</html>

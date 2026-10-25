@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: java-blueprints-engine
+
+groq:
+  base-url: https://api.groq.com/openai/v1
+  api-key: "${GROQ_API_KEY:}"
+  model: openai/gpt-oss-120b
+  max-completion-tokens: 4096
+  connect-timeout-ms: 10000
+  read-timeout-ms: 90000
