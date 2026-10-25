@@ -21,6 +21,24 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Service
 public class JavaParserService {
 
+    public String updateNode(String code, String nodeId, String replacement) {
+        GraphResponse graph = parse(code);
+        Node selected = graph.getNodes().stream()
+                .filter(node -> node.getId().equals(nodeId))
+                .findFirst().orElseThrow(() -> new IllegalArgumentException("Узел графа не найден"));
+        if (replacement == null || replacement.isBlank()) {
+            throw new IllegalArgumentException("Новый текст узла не должен быть пустым");
+        }
+        String[] lines = code.split("\\R", -1);
+        int line = selected.getLine() - 1;
+        if (line < 0 || line >= lines.length) throw new IllegalArgumentException("У узла нет строки исходника");
+        String indent = lines[line].substring(0, lines[line].length() - lines[line].stripLeading().length());
+        lines[line] = indent + replacement.strip();
+        String updated = String.join("\n", lines);
+        StaticJavaParser.parse(updated);
+        return updated;
+    }
+
     public GraphResponse parse(String code) {
         CompilationUnit cu = StaticJavaParser.parse(code);
         List<Node> nodes = new ArrayList<>();

@@ -26,7 +26,10 @@ public class AiAnalysisService {
             "recommendation",
             "current_big_o",
             "optimized_big_o",
-            "optimized_code"
+            "optimized_code",
+            "issue_start_line",
+            "issue_end_line",
+            "complexity_scope"
     );
 
     private static final String SYSTEM_PROMPT = """
@@ -48,6 +51,10 @@ public class AiAnalysisService {
             6. Если улучшение сомнительно или полный код не помещается,
                optimized_code должен быть пустой строкой.
             7. Не утверждай, что тесты пройдены: ты их не запускаешь.
+            8. issue_start_line и issue_end_line — номера строк конкретной
+               проблемы; если дефекта нет, верни пустые строки.
+            9. complexity_scope — имя метода или фрагмента, к которому
+               относятся current_big_o и optimized_big_o.
             
             Сохранение поведения включает исключения и обработку null.
             Не добавляй проверки null, возвраты по умолчанию или обработчики

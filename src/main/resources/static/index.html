@@ -138,6 +138,7 @@
     let filename = 'Demo.java';
     let busy = false;
     let revision = 0;
+    let currentGraph = null;
 
     const example = `public class Demo {
         public static boolean hasDuplicates(int[] xs) {
@@ -167,13 +168,22 @@
 
     function invalidate() {
         revision++;
+
         $('candidate').value = '';
         $('downloadCandidate').disabled = true;
-        $('diagnosis').textContent =
-            'Исходник изменён. Запустите анализ заново.';
+
+        $('diagnosis').textContent = 'Исходник изменён. Запустите анализ заново.';
+        $('diagnosis').onclick = null;
+        $('diagnosis').title = '';
+        $('diagnosis').style.cursor = '';
+
         $('oldO').textContent = '—';
         $('newO').textContent = '—';
+
         $('graph').replaceChildren();
+        currentGraph = null;
+
+        resetQualityReports();
     }
 
     source.addEventListener('input', invalidate);
@@ -299,34 +309,82 @@
         const code = source.value;
         const currentRevision = revision;
 
-        // Не оставляем старое предложение после неудачного нового запроса.
+        candidateCheckOutput.textContent = 'Не проверено.';
+        candidateCheckOutput.style.color = '';
+
         $('candidate').value = '';
         $('downloadCandidate').disabled = true;
+
         $('diagnosis').textContent = 'Анализ выполняется…';
+        $('diagnosis').onclick = null;
+        $('diagnosis').title = '';
+        $('diagnosis').style.cursor = '';
+
         $('oldO').textContent = '—';
         $('newO').textContent = '—';
 
-        const data = await api('/api/analyze', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({code})
-        });
+        let data;
 
-        if (currentRevision !== revision) {
+        try {
+            data = await api('/api/analyze', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ code })
+            });
+        } catch (error) {
+            if (currentRevision === revision) {
+                $('diagnosis').textContent =
+                    'Анализ не выполнен: ' + error.message;
+            }
+
+            throw error;
+        }
+
+        if (currentRevision !== revision || source.value !== code) {
             status('Исходник изменился. Результат отброшен, повторите анализ.');
             return;
         }
 
+        // Вычисляем здесь: data уже получен и доступен.
+        const linkedNodes = nodesAtLine(data.issue_start_line);
+
+        const linkedNodesText = linkedNodes.length
+            ? linkedNodes
+                .map(node => `${node.id} (${node.type})`)
+                .join(', ')
+            : 'не найдены — постройте граф для текущего исходника';
+
         $('diagnosis').textContent =
             `Диагноз: ${data.defect_found || '—'}\n\n` +
             `Риск: ${data.risk || '—'}\n\n` +
-            `Рекомендация: ${data.recommendation || '—'}`;
+            `Рекомендация: ${data.recommendation || '—'}\n\n` +
+            `Фрагмент: ${data.complexity_scope || 'не указан'}\n` +
+            `Строки проблемы: ${data.issue_start_line || 'не указаны'}` +
+            (data.issue_end_line &&
+             data.issue_end_line !== data.issue_start_line
+                ? `–${data.issue_end_line}`
+                : '') +
+            `\nУзлы на строке: ${linkedNodesText}`;
+
+        const issueLine = Number(data.issue_start_line);
+        const lineCount = code.split(/\r\n|\n|\r/).length;
+
+        if (Number.isInteger(issueLine)
+                && issueLine >= 1
+                && issueLine <= lineCount) {
+            $('diagnosis').style.cursor = 'pointer';
+            $('diagnosis').title = 'Нажмите, чтобы перейти к строке';
+            $('diagnosis').onclick = () => goToLine(issueLine);
+        }
 
         $('oldO').textContent = data.current_big_o || '—';
         $('newO').textContent = data.optimized_big_o || '—';
 
         const candidate = typeof data.optimized_code === 'string'
-            ? data.optimized_code : '';
+            ? data.optimized_code
+            : '';
 
         $('candidate').value = candidate;
         $('downloadCandidate').disabled = !candidate.trim();
@@ -367,6 +425,7 @@
     function renderGraph(graph) {
         const container = $('graph');
         container.replaceChildren();
+        currentGraph = graph;
 
         if (!graph.nodes.length) {
             container.textContent = 'Парсер не вернул узлов.';
@@ -446,6 +505,81 @@
             }, text.length > 57 ? text.slice(0, 54) + '…' : text));
 
             group.addEventListener('click', () => goToLine(node.line));
+            group.addEventListener('dblclick', async () => {
+                if (busy) return;
+
+                const originalCode = source.value;
+                const originalRevision = revision;
+
+                const lines = originalCode.split(/\r\n|\n|\r/);
+                const lineIndex = Number(node.line) - 1;
+
+                if (!Number.isInteger(lineIndex)
+                        || lineIndex < 0
+                        || lineIndex >= lines.length) {
+                    status('У узла нет корректной строки исходника.', 'error');
+                    return;
+                }
+
+                goToLine(node.line);
+
+                const currentLine = lines[lineIndex];
+
+                const replacement = window.prompt(
+                    `Редактирование всей строки ${node.line}:`,
+                    currentLine.trim()
+                );
+
+                if (replacement === null || replacement === currentLine.trim()) {
+                    return;
+                }
+
+                if (!replacement.trim()) {
+                    status('Новый текст не должен быть пустым.', 'error');
+                    return;
+                }
+
+                await run('Применяем изменение…', async () => {
+                    const result = await api('/api/parse/edit', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            code: originalCode,
+                            nodeId: node.id,
+                            text: replacement
+                        })
+                    });
+
+                    if (revision !== originalRevision
+                            || source.value !== originalCode) {
+                        status(
+                            'Исходник изменился во время запроса. ' +
+                            'Ответ не применён.'
+                        );
+                        return;
+                    }
+
+                    if (typeof result.code !== 'string'
+                            || !result.graph
+                            || !Array.isArray(result.graph.nodes)
+                            || !Array.isArray(result.graph.edges)) {
+                        throw new Error('Backend вернул некорректный результат редактирования.');
+                    }
+
+                    source.value = result.code;
+
+                    invalidate();
+                    renderGraph(result.graph);
+
+                    status(
+                        'Исходник обновлён, граф перестроен. ' +
+                        'Компиляция и поведение ещё не проверены.',
+                        'ok'
+                    );
+                });
+            });
             group.addEventListener('keydown', event => {
                 if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
@@ -457,6 +591,20 @@
         });
 
         container.append(svg);
+    }
+
+    function nodesAtLine(line) {
+        const number = Number(line);
+
+        if (!currentGraph
+                || !Number.isInteger(number)
+                || number < 1) {
+            return [];
+        }
+
+        return currentGraph.nodes.filter(
+            node => Number(node.line) === number
+        );
     }
 
     function download(text, name) {
@@ -622,25 +770,6 @@
 
     checkSourceButton.addEventListener('click', () => checkVersion('source'));
     checkCandidateButton.addEventListener('click', () => checkVersion('candidate'));
-
-    // Старый отчёт нельзя показывать как актуальный для нового исходника.
-    source.addEventListener('input', resetQualityReports);
-
-    document.getElementById('file').addEventListener(
-        'change', resetQualityReports
-    );
-
-    document.getElementById('demo').addEventListener(
-        'click', resetQualityReports
-    );
-
-    // Новый анализ создаёт другое предложение.
-    document.getElementById('analyze').addEventListener('click', () => {
-        if (!busy) return;
-
-        candidateCheckOutput.textContent = 'Не проверено.';
-        candidateCheckOutput.style.color = '';
-    });
 </script>
 </body>
 </html>

@@ -4,7 +4,7 @@ spring:
 
 groq:
   base-url: https://api.groq.com/openai/v1
-  api-key: "${GROQ_API_KEY:}"
+  api-key: "${GROQ_API_KEY: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}"
   model: openai/gpt-oss-120b
   max-completion-tokens: 4096
   connect-timeout-ms: 10000

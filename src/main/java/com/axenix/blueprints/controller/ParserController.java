@@ -15,6 +15,8 @@ import java.nio.charset.StandardCharsets;
 @CrossOrigin(origins = "*") // Чтобы Postman/Frontend могли стучаться
 public class ParserController {
 
+    public record EditRequest(String code, String nodeId, String text) {}
+
     @Autowired
     private JavaParserService parserService;
 
@@ -28,6 +30,16 @@ public class ParserController {
             return ResponseEntity.badRequest().body("Ошибка чтения файла: " + e.getMessage());
         } catch (Exception e) {
             return ResponseEntity.badRequest().body("Ошибка парсинга кода: " + e.getMessage());
+        }
+    }
+
+    @PostMapping("/edit")
+    public ResponseEntity<?> editNode(@RequestBody EditRequest request) {
+        try {
+            String updated = parserService.updateNode(request.code(), request.nodeId(), request.text());
+            return ResponseEntity.ok(java.util.Map.of("code", updated, "graph", parserService.parse(updated)));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(java.util.Map.of("message", e.getMessage()));
         }
     }
 }
