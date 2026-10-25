@@ -3,178 +3,297 @@ package com.axenix.blueprints.service;
 import com.axenix.blueprints.model.CompilationError;
 import com.axenix.blueprints.model.QualityGateResponse;
 import com.axenix.blueprints.model.TestResult;
-import org.junit.runner.JUnitCore;
-import org.junit.runner.Result;
-import org.junit.runner.notification.Failure;
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import org.springframework.stereotype.Service;
 
 import javax.tools.*;
 import java.io.File;
-import java.io.IOException;
-import java.lang.reflect.Method;
-import java.net.URL;
-import java.net.URLClassLoader;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.util.*;
-import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 @Service
 public class QualityGateService {
 
-    public QualityGateResponse check(String code, Class<?> testClass) {
-        long startTime = System.currentTimeMillis();
-        Path tempDir = null;
+    public QualityGateResponse check(String code, String testClassName) {
+        long started = System.currentTimeMillis();
+        Path directory = null;
+        Process process = null;
+
         try {
-            tempDir = Files.createTempDirectory("javacompile");
-            String className = extractPublicClassName(code);
-            if (className == null) {
-                className = "CompiledClass";
+            if (code == null || code.isBlank()) {
+                return error(started, "invalid_input", "Пустой исходный код");
             }
-            Path javaFile = tempDir.resolve(className + ".java");
-            Files.write(javaFile, code.getBytes(StandardCharsets.UTF_8));
+
+
+            if (!"TestMonolithTest".equals(testClassName)) {
+                return error(
+                        started,
+                        "invalid_input",
+                        "Этот сценарий поддерживает только TestMonolithTest"
+                );
+            }
+
+            Path testFile = Path.of(
+                    "target", "test-classes", "TestMonolithTest.class"
+            ).toAbsolutePath();
+
+            if (!Files.isRegularFile(testFile)) {
+                return error(
+                        started,
+                        "infrastructure_error",
+                        "Нет скомпилированного теста: " + testFile
+                                + ". Выполните mvn test"
+                );
+            }
+
+            CompilationUnit unit = StaticJavaParser.parse(code);
+
+            boolean correctClass = unit.getTypes().stream().anyMatch(type ->
+                    type instanceof ClassOrInterfaceDeclaration
+                            && type.getNameAsString().equals("TestMonolith")
+                            && type.isPublic()
+            );
+
+            if (unit.getPackageDeclaration().isPresent() || !correctClass) {
+                return error(started, "invalid_input",
+                        "Нужен полный public class TestMonolith без package");
+            }
 
             JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+
             if (compiler == null) {
-                return new QualityGateResponse(false, "compilation_error", 0, 0, System.currentTimeMillis() - startTime,
-                        Collections.emptyList(), Collections.emptyList(), "Java compiler not available");
+                return error(started, "infrastructure_error",
+                        "Компилятор недоступен. Запустите приложение на JDK");
             }
 
-            DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
-            StandardJavaFileManager fileManager = compiler.getStandardFileManager(diagnostics, null, StandardCharsets.UTF_8);
+            directory = Files.createTempDirectory("blueprints-quality-");
+            Path source = directory.resolve("TestMonolith.java");
+            Path reportFile = directory.resolve("report.properties");
+            Path processLog = directory.resolve("process.log");
 
-            Iterable<? extends JavaFileObject> compilationUnits = fileManager.getJavaFileObjectsFromFiles(Collections.singletonList(javaFile.toFile()));
-            List<String> options = Arrays.asList("-classpath", buildClasspath(), "-d", tempDir.toString());
+            Files.writeString(source, code, StandardCharsets.UTF_8);
 
-            JavaCompiler.CompilationTask task = compiler.getTask(null, fileManager, diagnostics, options, null, compilationUnits);
-            boolean success = task.call();
-            fileManager.close();
+            String classpath = buildClasspath();
+            DiagnosticCollector<JavaFileObject> diagnostics =
+                    new DiagnosticCollector<>();
 
-            if (!success) {
-                List<CompilationError> errors = diagnostics.getDiagnostics().stream()
-                        .filter(d -> d.getKind() == Diagnostic.Kind.ERROR)
-                        .map(d -> new CompilationError(
-                                String.valueOf(d.getLineNumber()),
-                                String.valueOf(d.getColumnNumber()),
-                                d.getMessage(null),
-                                d.getKind().toString()
-                        ))
-                        .collect(Collectors.toList());
-                String errorText = errors.stream()
-                        .map(e -> "line " + e.getLine() + ":" + e.getColumn() + " " + e.getMessage())
-                        .collect(Collectors.joining("\n"));
-                return new QualityGateResponse(false, "compilation_error", 0, 0, System.currentTimeMillis() - startTime,
-                        errors, Collections.emptyList(), errorText.isEmpty() ? "Ошибка компиляции" : errorText);
+            boolean compiled;
+
+            try (StandardJavaFileManager manager =
+                         compiler.getStandardFileManager(
+                                 diagnostics, Locale.ROOT,
+                                 StandardCharsets.UTF_8
+                         )) {
+
+                Iterable<? extends JavaFileObject> files =
+                        manager.getJavaFileObjects(source.toFile());
+
+                List<String> options = List.of(
+                        "-encoding", "UTF-8",
+                        "-proc:none",
+                        "-classpath", classpath,
+                        "-d", directory.toString()
+                );
+
+                compiled = Boolean.TRUE.equals(
+                        compiler.getTask(
+                                null, manager, diagnostics,
+                                options, null, files
+                        ).call()
+                );
             }
 
-            URLClassLoader classLoader = new URLClassLoader(new URL[]{tempDir.toUri().toURL()}, this.getClass().getClassLoader());
-            Result result = JUnitCore.runClasses(testClass);
-            List<TestResult> testResults = new ArrayList<>();
-            for (Failure failure : result.getFailures()) {
-                String testName = failure.getTestHeader();
-                String trace = failure.getTrace();
-                String expected = "N/A";
-                String actual = "N/A";
-                // Try to extract expected/actual if present
-                if (failure.getException() instanceof AssertionError) {
-                    String msg = failure.getMessage();
-                    if (msg != null) {
-                        if (msg.contains("expected:")) {
-                            int idx = msg.indexOf("expected:");
-                            String sub = msg.substring(idx);
-                            if (sub.contains("but was:")) {
-                                String[] parts = sub.split("but was:");
-                                expected = parts[0].replace("expected:", "").trim();
-                                actual = parts.length > 1 ? parts[1].trim() : "N/A";
-                            }
-                        }
+            if (!compiled) {
+                List<CompilationError> errors = new ArrayList<>();
+
+                for (Diagnostic<? extends JavaFileObject> diagnostic
+                        : diagnostics.getDiagnostics()) {
+
+                    if (diagnostic.getKind() == Diagnostic.Kind.ERROR) {
+                        errors.add(new CompilationError(
+                                String.valueOf(diagnostic.getLineNumber()),
+                                String.valueOf(diagnostic.getColumnNumber()),
+                                diagnostic.getMessage(Locale.ROOT),
+                                diagnostic.getKind().name()
+                        ));
                     }
                 }
-                testResults.add(new TestResult(testName, false, expected, actual, trace));
+
+                return new QualityGateResponse(
+                        false, "compilation_error", 0, 0,
+                        elapsed(started), errors, List.of(),
+                        "Кандидат не прошёл компиляцию"
+                );
             }
 
-            int totalTests = result.getRunCount();
-            int passedTests = result.getRunCount() - result.getFailureCount();
-            long execTime = System.currentTimeMillis() - startTime;
+            String executable = System.getProperty("os.name")
+                    .toLowerCase(Locale.ROOT).contains("win")
+                    ? "java.exe" : "java";
 
-            if (result.wasSuccessful()) {
-                return new QualityGateResponse(true, "ok", totalTests, passedTests, execTime, Collections.emptyList(), testResults, "Все тесты пройдены");
-            } else {
-                String failedMsg = result.getFailures().isEmpty() ? "Тесты не пройдены" :
-                        "Тест " + result.getFailures().get(0).getTestHeader() + " упал, ожидалось " +
-                                (result.getFailures().get(0).getMessage() != null ? result.getFailures().get(0).getMessage() : "X") + ", получено Y";
-                // Better message
-                if (!result.getFailures().isEmpty()) {
-                    Failure f = result.getFailures().get(0);
-                    String msg = f.getMessage();
-                    if (msg != null && msg.contains("expected:") && msg.contains("but was:")) {
-                        String[] parts = msg.split("but was:");
-                        String exp = parts[0].replace("expected:", "").trim();
-                        String act = parts[1].trim().split("\n")[0];
-                        failedMsg = "Тест " + f.getTestHeader() + " упал, ожидалось " + exp + ", получено " + act;
-                    } else if (msg != null) {
-                        failedMsg = "Тест " + f.getTestHeader() + " упал: " + msg;
-                    }
-                }
-                return new QualityGateResponse(false, "tests_failed", totalTests, passedTests, execTime, Collections.emptyList(), testResults, failedMsg);
+            Path java = Path.of(
+                    System.getProperty("java.home"), "bin", executable
+            );
+
+            // Кандидат ПЕРВЫМ: тесты должны обращаться к новой версии.
+            String childClasspath =
+                    directory.toAbsolutePath() + File.pathSeparator + classpath;
+
+            ProcessBuilder builder = new ProcessBuilder(
+                    java.toString(),
+                    "-Xmx256m",
+                    "-cp", childClasspath,
+                    QualityGateRunner.class.getName(),
+                    testClassName,
+                    directory.toAbsolutePath().toString(),
+                    reportFile.toAbsolutePath().toString()
+            );
+
+            builder.redirectErrorStream(true);
+            builder.redirectOutput(processLog.toFile());
+
+            builder.environment().keySet().removeIf(
+                    key -> key.equalsIgnoreCase("GROQ_API_KEY")
+            );
+
+            process = builder.start();
+
+            if (!process.waitFor(15, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(3, TimeUnit.SECONDS);
+
+                return error(started, "timeout",
+                        "Превышен лимит выполнения тестов: 15 секунд");
             }
+
+            if (!Files.isRegularFile(reportFile)) {
+                return error(started, "infrastructure_error",
+                        "Runner не создал отчёт. Код выхода: "
+                                + process.exitValue()
+                                + ". " + readLog(processLog));
+            }
+
+            Properties report = new Properties();
+
+            try (InputStream input = Files.newInputStream(reportFile)) {
+                report.load(input);
+            }
+
+            int total = Integer.parseInt(report.getProperty("total"));
+            int failed = Integer.parseInt(report.getProperty("failed"));
+            int ignored = Integer.parseInt(report.getProperty("ignored"));
+
+            List<TestResult> results = new ArrayList<>();
+
+            for (int i = 0; i < failed; i++) {
+                results.add(new TestResult(
+                        report.getProperty("failure." + i + ".name", "test"),
+                        false,
+                        "Согласно исходному контракту",
+                        "Проверка не пройдена",
+                        report.getProperty("failure." + i + ".trace", "")
+                ));
+            }
+
+            boolean success = process.exitValue() == 0
+                    && total > 0 && failed == 0 && ignored == 0;
+
+            return new QualityGateResponse(
+                    success,
+                    success ? "ok" : "tests_failed",
+                    total,
+                    Math.max(0, total - failed),
+                    elapsed(started),
+                    List.of(),
+                    results,
+                    success
+                            ? "Кандидат прошёл " + total + " проверок"
+                            : "Проверка не пройдена: выполнено " + total
+                            + ", ошибок " + failed
+                            + ", пропущено " + ignored
+            );
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return error(started, "infrastructure_error",
+                    "Проверка прервана");
+
         } catch (Exception e) {
-            long execTime = System.currentTimeMillis() - startTime;
-            return new QualityGateResponse(false, "compilation_error", 0, 0, execTime, Collections.emptyList(), Collections.emptyList(), e.getMessage());
+            return error(started, "infrastructure_error",
+                    e.getClass().getSimpleName() + ": " + e.getMessage());
+
         } finally {
-            if (tempDir != null) {
+            if (process != null && process.isAlive()) {
+                process.destroyForcibly();
                 try {
-                    deleteDirectory(tempDir.toFile());
-                } catch (Exception ignored) {
+                    process.waitFor(3, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
+            }
+
+            if (directory != null) {
+                deleteDirectory(directory);
             }
         }
     }
 
     private String buildClasspath() {
-        StringBuilder sb = new StringBuilder();
-        String classpath = System.getProperty("java.class.path");
-        if (classpath != null && !classpath.isEmpty()) {
-            sb.append(classpath);
-        }
-        // Also add target/classes if exists
-        File targetClasses = new File("target/classes");
-        if (targetClasses.exists()) {
-            if (sb.length() > 0) sb.append(File.pathSeparator);
-            sb.append(targetClasses.getAbsolutePath());
-        }
-        File testClasses = new File("target/test-classes");
-        if (testClasses.exists()) {
-            if (sb.length() > 0) sb.append(File.pathSeparator);
-            sb.append(testClasses.getAbsolutePath());
-        }
-        return sb.toString();
-    }
+        Set<String> entries = new LinkedHashSet<>();
 
-    private String extractPublicClassName(String code) {
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("public\\s+class\\s+(\\w+)").matcher(code);
-        if (m.find()) {
-            return m.group(1);
-        }
-        m = java.util.regex.Pattern.compile("class\\s+(\\w+)").matcher(code);
-        if (m.find()) {
-            return m.group(1);
-        }
-        return null;
-    }
+        entries.add(Path.of("target/classes").toAbsolutePath().toString());
+        entries.add(Path.of("target/test-classes").toAbsolutePath().toString());
 
-    private void deleteDirectory(File directory) {
-        File[] files = directory.listFiles();
-        if (files != null) {
-            for (File file : files) {
-                if (file.isDirectory()) {
-                    deleteDirectory(file);
-                } else {
-                    file.delete();
-                }
+        String current = System.getProperty("java.class.path", "");
+
+        for (String entry : current.split(
+                java.util.regex.Pattern.quote(File.pathSeparator))) {
+            if (!entry.isBlank()) {
+                entries.add(Path.of(entry).toAbsolutePath().toString());
             }
         }
-        directory.delete();
+
+        return String.join(File.pathSeparator, entries);
+    }
+
+    private String readLog(Path file) {
+        try (java.io.Reader reader =
+                     Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            char[] buffer = new char[2000];
+            int count = reader.read(buffer);
+            return count < 0 ? "" : new String(buffer, 0, count);
+        } catch (Exception e) {
+            return "Не удалось прочитать журнал runner";
+        }
+    }
+
+    private QualityGateResponse error(
+            long started, String status, String message) {
+
+        return new QualityGateResponse(
+                false, status, 0, 0, elapsed(started),
+                List.of(), List.of(), message
+        );
+    }
+
+    private long elapsed(long started) {
+        return System.currentTimeMillis() - started;
+    }
+
+    private void deleteDirectory(Path directory) {
+        try (Stream<Path> paths = Files.walk(directory)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (Exception ignored) {
+                }
+            });
+        } catch (Exception ignored) {
+        }
     }
 }

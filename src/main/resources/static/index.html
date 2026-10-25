@@ -99,6 +99,33 @@
         <textarea id="candidate" readonly spellcheck="false"
                   aria-label="Предложенный Java-код"></textarea>
     </section>
+    <section class="panel wide">
+        <div class="bar">
+            <h2>Автоматическая проверка</h2>
+            <button id="checkSource">Проверить исходник</button>
+            <button id="checkCandidate">Проверить предложение ИИ</button>
+        </div>
+
+        <div class="note">
+            Сейчас поддерживается только public class TestMonolith без package.
+            Набор: TestMonolithTest, 6 проверок.
+            Успешный результат относится только к выполненным тестам.
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;padding:14px">
+            <div>
+                <h3>Исходная версия</h3>
+                <pre id="sourceCheck"
+                     style="white-space:pre-wrap;overflow-wrap:anywhere">Не проверена.</pre>
+            </div>
+
+            <div>
+                <h3>Предложение ИИ</h3>
+                <pre id="candidateCheck"
+                     style="white-space:pre-wrap;overflow-wrap:anywhere">Не проверено.</pre>
+            </div>
+        </div>
+    </section>
 </main>
 
 <div id="status" role="status" aria-live="polite">Готово к работе.</div>
@@ -455,6 +482,165 @@
     };
 
     source.value = example;
+</script>
+<script>
+    'use strict';
+
+    const checkSourceButton = document.getElementById('checkSource');
+    const checkCandidateButton = document.getElementById('checkCandidate');
+
+    const sourceCheckOutput = document.getElementById('sourceCheck');
+    const candidateCheckOutput = document.getElementById('candidateCheck');
+
+    function resetQualityReports() {
+        sourceCheckOutput.textContent = 'Не проверена.';
+        candidateCheckOutput.textContent = 'Не проверено.';
+
+        sourceCheckOutput.style.color = '';
+        candidateCheckOutput.style.color = '';
+    }
+
+    function formatQualityReport(data) {
+        const lines = [
+            data.success
+                ? 'ПРОВЕРКИ ПРОЙДЕНЫ'
+                : 'ПРОВЕРКА НЕ ПРОЙДЕНА',
+            '',
+            `Статус: ${data.status}`,
+            `Пройдено: ${data.passedTests} из ${data.totalTests}`,
+            `Время проверки: ${data.executionTimeMs} мс`,
+            '',
+            data.message || ''
+        ];
+
+        if (Array.isArray(data.compilationErrors)) {
+            for (const error of data.compilationErrors) {
+                lines.push(
+                    '',
+                    `Ошибка компиляции: строка ${error.line}, столбец ${error.column}`,
+                    error.message || ''
+                );
+            }
+        }
+
+        if (Array.isArray(data.testResults)) {
+            for (const test of data.testResults) {
+                if (test.passed) continue;
+
+                lines.push(
+                    '',
+                    `Тест: ${test.testName}`,
+                    test.message || 'Проверка не пройдена'
+                );
+            }
+        }
+
+        return lines.join('\n');
+    }
+
+    async function checkVersion(kind) {
+        // busy, revision, api и status определены в основном скрипте.
+        if (busy) return;
+
+        const originalSnapshot = source.value;
+        const candidateSnapshot = document.getElementById('candidate').value;
+        const revisionSnapshot = revision;
+
+        const isCandidate = kind === 'candidate';
+        const code = isCandidate ? candidateSnapshot : originalSnapshot;
+        const output = isCandidate
+            ? candidateCheckOutput
+            : sourceCheckOutput;
+
+        if (!code.trim()) {
+            status(
+                isCandidate
+                    ? 'Сначала получите предложение ИИ.'
+                    : 'Сначала загрузите исходный код.',
+                'error'
+            );
+            return;
+        }
+
+        checkSourceButton.disabled = true;
+        checkCandidateButton.disabled = true;
+
+        try {
+            await run('Компиляция и запуск тестов…', async () => {
+                output.textContent = 'Проверка выполняется…';
+                output.style.color = '';
+
+                const data = await api(
+                    '/api/quality/check?testClass=TestMonolithTest',
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'text/plain; charset=utf-8'
+                        },
+                        body: code
+                    }
+                );
+
+                const sourceChanged =
+                    revision !== revisionSnapshot ||
+                    source.value !== originalSnapshot;
+
+                const candidateChanged =
+                    isCandidate &&
+                    document.getElementById('candidate').value !== candidateSnapshot;
+
+                if (sourceChanged || candidateChanged) {
+                    output.textContent =
+                        'Код изменился во время запроса. Повторите проверку.';
+                    output.style.color = '#ffbf91';
+                    status('Устаревший результат проверки не применён.');
+                    return;
+                }
+
+                output.textContent = formatQualityReport(data);
+                output.style.color = data.success ? '#baf5da' : '#ffb4b4';
+
+                status(
+                    data.success
+                        ? `Проверки пройдены: ${data.passedTests}/${data.totalTests}.`
+                        : `Проверка не пройдена: ${data.message || data.status}`,
+                    data.success ? 'ok' : 'error'
+                );
+            });
+        } finally {
+            checkSourceButton.disabled = false;
+            checkCandidateButton.disabled = false;
+
+            // run() показывает ошибку в общем статусе.
+            if (output.textContent === 'Проверка выполняется…') {
+                output.textContent =
+                    'Не удалось завершить запрос. Подробности в строке статуса.';
+                output.style.color = '#ffb4b4';
+            }
+        }
+    }
+
+    checkSourceButton.addEventListener('click', () => checkVersion('source'));
+    checkCandidateButton.addEventListener('click', () => checkVersion('candidate'));
+
+    // Старый отчёт нельзя показывать как актуальный для нового исходника.
+    source.addEventListener('input', resetQualityReports);
+
+    document.getElementById('file').addEventListener(
+        'change', resetQualityReports
+    );
+
+    document.getElementById('demo').addEventListener(
+        'click', resetQualityReports
+    );
+
+    // Новый анализ создаёт другое предложение.
+    document.getElementById('analyze').addEventListener('click', () => {
+        if (!busy) return;
+
+        candidateCheckOutput.textContent = 'Не проверено.';
+        candidateCheckOutput.style.color = '';
+    });
 </script>
 </body>
 </html>
