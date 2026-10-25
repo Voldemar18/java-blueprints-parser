@@ -13,30 +13,165 @@ import com.github.javaparser.ast.expr.VariableDeclarationExpr;
 import com.github.javaparser.ast.stmt.*;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import org.springframework.stereotype.Service;
+import com.github.javaparser.ast.expr.Expression;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class JavaParserService {
 
-    public String updateNode(String code, String nodeId, String replacement) {
-        GraphResponse graph = parse(code);
-        Node selected = graph.getNodes().stream()
-                .filter(node -> node.getId().equals(nodeId))
-                .findFirst().orElseThrow(() -> new IllegalArgumentException("Узел графа не найден"));
-        if (replacement == null || replacement.isBlank()) {
-            throw new IllegalArgumentException("Новый текст узла не должен быть пустым");
+    private record EditContext(
+            CompilationUnit unit,
+            com.github.javaparser.ast.Node target
+    ) {
+    }
+
+    private EditContext findEditTarget(String code, String nodeId) {
+        if (code == null || code.isBlank()) {
+            throw new IllegalArgumentException("Исходный код пуст");
         }
-        String[] lines = code.split("\\R", -1);
-        int line = selected.getLine() - 1;
-        if (line < 0 || line >= lines.length) throw new IllegalArgumentException("У узла нет строки исходника");
-        String indent = lines[line].substring(0, lines[line].length() - lines[line].stripLeading().length());
-        lines[line] = indent + replacement.strip();
-        String updated = String.join("\n", lines);
-        StaticJavaParser.parse(updated);
-        return updated;
+
+        if (nodeId == null || nodeId.isBlank()) {
+            throw new IllegalArgumentException("Не указан ID узла");
+        }
+
+        CompilationUnit unit = StaticJavaParser.parse(code);
+
+        List<Node> nodes = new ArrayList<>();
+        List<Edge> edges = new ArrayList<>();
+
+        GraphVisitor visitor = new GraphVisitor(
+                nodes,
+                edges,
+                new AtomicInteger(1)
+        );
+
+        unit.accept(visitor, null);
+
+        com.github.javaparser.ast.Node target =
+                visitor.astNodes.get(nodeId);
+
+        if (target == null) {
+            throw new IllegalArgumentException(
+                    "Узел не найден. Перестройте граф для текущего исходника"
+            );
+        }
+
+        return new EditContext(unit, target);
+    }
+
+    private Expression editableExpression(
+            com.github.javaparser.ast.Node target
+    ) {
+        if (target instanceof ReturnStmt statement) {
+            return statement.getExpression().orElseThrow(
+                    () -> new IllegalArgumentException(
+                            "return без выражения пока не редактируется"
+                    )
+            );
+        }
+
+        if (target instanceof IfStmt statement) {
+            return statement.getCondition();
+        }
+
+        if (target instanceof WhileStmt statement) {
+            return statement.getCondition();
+        }
+
+        if (target instanceof ForStmt statement) {
+            return statement.getCompare().orElseThrow(
+                    () -> new IllegalArgumentException(
+                            "for без условия пока не редактируется"
+                    )
+            );
+        }
+
+        if (target instanceof ForEachStmt statement) {
+            return statement.getIterable();
+        }
+
+        if (target instanceof SwitchStmt statement) {
+            return statement.getSelector();
+        }
+
+        throw new IllegalArgumentException(
+                "Редактирование этого типа узла пока не поддерживается: "
+                        + target.getClass().getSimpleName()
+        );
+    }
+
+    private String editLabel(
+            com.github.javaparser.ast.Node target
+    ) {
+        if (target instanceof ReturnStmt) {
+            return "Выражение return — без return и точки с запятой";
+        }
+        if (target instanceof IfStmt) {
+            return "Условие if — только выражение";
+        }
+        if (target instanceof WhileStmt) {
+            return "Условие while — только выражение";
+        }
+        if (target instanceof ForStmt) {
+            return "Условие for — только выражение сравнения";
+        }
+        if (target instanceof ForEachStmt) {
+            return "Перебираемое выражение for-each";
+        }
+        if (target instanceof SwitchStmt) {
+            return "Выражение switch";
+        }
+
+        return "Выражение";
+    }
+
+    public Map<String, String> getNodeEditInfo(
+            String code,
+            String nodeId
+    ) {
+        EditContext context = findEditTarget(code, nodeId);
+        Expression expression = editableExpression(context.target());
+
+        return Map.of(
+                "nodeId", nodeId,
+                "label", editLabel(context.target()),
+                "text", expression.toString()
+        );
+    }
+
+    public String updateNode(
+            String code,
+            String nodeId,
+            String replacement
+    ) {
+        if (replacement == null || replacement.isBlank()) {
+            throw new IllegalArgumentException(
+                    "Новое выражение не должно быть пустым"
+            );
+        }
+
+        EditContext context = findEditTarget(code, nodeId);
+
+        Expression previous = editableExpression(context.target());
+        Expression updatedExpression =
+                StaticJavaParser.parseExpression(replacement.strip());
+
+        if (!previous.replace(updatedExpression)) {
+            throw new IllegalArgumentException(
+                    "Не удалось заменить выражение выбранного узла"
+            );
+        }
+
+        String updatedCode = context.unit().toString();
+
+        StaticJavaParser.parse(updatedCode);
+
+        return updatedCode;
     }
 
     public GraphResponse parse(String code) {
@@ -54,7 +189,13 @@ public class JavaParserService {
         private final List<Node> nodes;
         private final List<Edge> edges;
         private final AtomicInteger idCounter;
-        private String lastNodeId = null;
+        private record FlowExit(String nodeId, String label) {
+        }
+
+        private List<FlowExit> exits = new ArrayList<>();
+
+        private String currentClassId = null;
+        private final Map<String, com.github.javaparser.ast.Node> astNodes = new LinkedHashMap<>();
 
         public GraphVisitor(List<Node> nodes, List<Edge> edges, AtomicInteger idCounter) {
             this.nodes = nodes;
@@ -66,18 +207,48 @@ public class JavaParserService {
             return "node_" + idCounter.getAndIncrement();
         }
 
+        private String register(
+                com.github.javaparser.ast.Node astNode
+        ) {
+            String id = generateId();
+            astNodes.put(id, astNode);
+            return id;
+        }
+
         @Override
         public void visit(ClassOrInterfaceDeclaration n, Void arg) {
-            String id = generateId();
-            nodes.add(new Node(id, "class", n.getNameAsString(), n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
-            if (lastNodeId != null) edges.add(new Edge(lastNodeId, id, "contains"));
-            lastNodeId = id;
-            super.visit(n, arg);
+            String id = register(n);
+
+            nodes.add(new Node(
+                    id,
+                    n.isInterface() ? "interface" : "class",
+                    n.getNameAsString(),
+                    n.getBegin().map(p -> p.line).orElse(0),
+                    "unknown"
+            ));
+
+            String previousClassId = currentClassId;
+            List<FlowExit> previousExits = exits;
+
+            if (previousClassId != null) {
+                edges.add(new Edge(previousClassId, id, "contains"));
+            }
+
+            currentClassId = id;
+            exits = new ArrayList<>();
+
+            // Обходим объявления членов класса.
+            for (var member : n.getMembers()) {
+                member.accept(this, arg);
+            }
+
+            currentClassId = previousClassId;
+            exits = previousExits;
         }
 
         @Override
         public void visit(FieldDeclaration n, Void arg) {
-            String id = generateId();
+            String id = register(n);
             nodes.add(new Node(id, "field", n.toString().trim(), n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
             linkToPrevious(id, "next");
             super.visit(n, arg);
@@ -85,16 +256,34 @@ public class JavaParserService {
 
         @Override
         public void visit(MethodDeclaration n, Void arg) {
-            String id = generateId();
-            nodes.add(new Node(id, "method", n.getDeclarationAsString(false, false, false), n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
-            if (lastNodeId != null) edges.add(new Edge(lastNodeId, id, "contains"));
-            lastNodeId = id;
-            super.visit(n, arg);
+            String id = register(n);
+
+            nodes.add(new Node(
+                    id,
+                    "method",
+                    n.getDeclarationAsString(false, false, false),
+                    n.getBegin().map(p -> p.line).orElse(0),
+                    "unknown"
+            ));
+
+            if (currentClassId != null) {
+                edges.add(new Edge(currentClassId, id, "contains"));
+            }
+
+            List<FlowExit> previousExits = exits;
+
+            exits = new ArrayList<>();
+            exits.add(new FlowExit(id, "entry"));
+
+            n.getBody().ifPresent(body -> body.accept(this, arg));
+
+            // Выходы метода не становятся входом следующего метода.
+            exits = previousExits;
         }
 
         @Override
         public void visit(ForStmt n, Void arg) {
-            String id = generateId();
+            String id = register(n);
             String complexity = calculateComplexity(n);
             nodes.add(new Node(id, "loop_for", n.getInitialization() + " " + n.getCompare().orElse(null), n.getBegin().map(p -> p.line).orElse(0), complexity));
             linkToPrevious(id, "next");
@@ -103,7 +292,7 @@ public class JavaParserService {
 
         @Override
         public void visit(ForEachStmt n, Void arg) {
-            String id = generateId();
+            String id = register(n);
             String complexity = calculateComplexity(n);
             nodes.add(new Node(id, "loop_for_each", n.getVariable() + " : " + n.getIterable(), n.getBegin().map(p -> p.line).orElse(0), complexity));
             linkToPrevious(id, "next");
@@ -112,45 +301,66 @@ public class JavaParserService {
 
         @Override
         public void visit(WhileStmt n, Void arg) {
-            String id = generateId();
+            String id = register(n);
             String complexity = calculateComplexity(n);
             nodes.add(new Node(id, "loop_while", n.getCondition().toString(), n.getBegin().map(p -> p.line).orElse(0), complexity));
             linkToPrevious(id, "next");
             super.visit(n, arg);
         }
 
-        // ИСПРАВЛЕНО: Изолируем ветки if и else друг от друга
         @Override
         public void visit(IfStmt n, Void arg) {
-            String ifId = generateId();
-            nodes.add(new Node(ifId, "if", n.getCondition().toString(), n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
+            String ifId = register(n);
+
+            nodes.add(new Node(
+                    ifId,
+                    "if",
+                    n.getCondition().toString(),
+                    n.getBegin().map(p -> p.line).orElse(0),
+                    "unknown"
+            ));
+
             linkToPrevious(ifId, "next");
 
-            // Обрабатываем THEN-ветку (то, что внутри if)
-            lastNodeId = ifId;
+            exits = new ArrayList<>();
+            exits.add(new FlowExit(ifId, "true"));
+
             n.getThenStmt().accept(this, arg);
 
-            // Обрабатываем ELSE-ветку (если есть)
+            List<FlowExit> thenExits = new ArrayList<>(exits);
+
+            // Вход в ELSE или обход THEN, если ELSE отсутствует.
+            exits = new ArrayList<>();
+            exits.add(new FlowExit(ifId, "false"));
+
             if (n.getElseStmt().isPresent()) {
-                String elseId = generateId();
-                nodes.add(new Node(elseId, "else", "else block", n.getElseStmt().get().getBegin().map(p -> p.line).orElse(0), "O(1)"));
+                Statement elseStatement = n.getElseStmt().get();
 
-                // Стрелка от IF к ELSE с меткой "false"
-                edges.add(new Edge(ifId, elseId, "false"));
+                String elseId = register(elseStatement);
 
-                // Теперь узлы внутри else будут связаны с else
-                lastNodeId = elseId;
-                n.getElseStmt().get().accept(this, arg);
+                nodes.add(new Node(
+                        elseId,
+                        "else",
+                        "else",
+                        elseStatement.getBegin().map(p -> p.line).orElse(0),
+                        "unknown"
+                ));
+
+                linkToPrevious(elseId, "next");
+
+                elseStatement.accept(this, arg);
             }
 
-            // ВАЖНО: Мы НЕ вызываем super.visit(n, arg),
-            // так как мы уже вручную обошли then и else.
-            // Если вызвать super, JavaParser обойдет их повторно, создав дубликаты!
+            List<FlowExit> elseExits = new ArrayList<>(exits);
+
+            exits = new ArrayList<>();
+            exits.addAll(thenExits);
+            exits.addAll(elseExits);
         }
 
         @Override
         public void visit(SwitchStmt n, Void arg) {
-            String id = generateId();
+            String id = register(n);
             nodes.add(new Node(id, "switch", n.getSelector().toString(), n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
             linkToPrevious(id, "next");
             super.visit(n, arg);
@@ -158,15 +368,28 @@ public class JavaParserService {
 
         @Override
         public void visit(ReturnStmt n, Void arg) {
-            String id = generateId();
-            nodes.add(new Node(id, "return", n.getExpression().map(Object::toString).orElse("void"), n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
+            n.getExpression().ifPresent(expression ->
+                    expression.accept(this, arg)
+            );
+
+            String id = register(n);
+
+            nodes.add(new Node(
+                    id,
+                    "return",
+                    n.getExpression().map(Object::toString).orElse("void"),
+                    n.getBegin().map(p -> p.line).orElse(0),
+                    "unknown"
+            ));
+
             linkToPrevious(id, "next");
-            super.visit(n, arg);
+
+            exits = new ArrayList<>();
         }
 
         @Override
         public void visit(MethodCallExpr n, Void arg) {
-            String id = generateId();
+            String id = register(n);
             String callText = (n.getScope().isPresent() ? n.getScope().get() + "." : "") + n.getNameAsString() + "()";
             nodes.add(new Node(id, "method_call", callText, n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
             linkToPrevious(id, "next");
@@ -181,15 +404,27 @@ public class JavaParserService {
                     return;
                 }
             }
-            String id = generateId();
+            String id = register(n);
             nodes.add(new Node(id, "variable", n.toString(), n.getBegin().map(p -> p.line).orElse(0), "O(1)"));
             linkToPrevious(id, "next");
             super.visit(n, arg);
         }
 
-        private void linkToPrevious(String currentId, String label) {
-            if (lastNodeId != null) edges.add(new Edge(lastNodeId, currentId, label));
-            lastNodeId = currentId;
+        private void linkToPrevious(String currentId, String defaultLabel) {
+            for (FlowExit exit : exits) {
+                String label = exit.label() == null
+                        ? defaultLabel
+                        : exit.label();
+
+                edges.add(new Edge(
+                        exit.nodeId(),
+                        currentId,
+                        label
+                ));
+            }
+
+            exits = new ArrayList<>();
+            exits.add(new FlowExit(currentId, null));
         }
 
         // --- ЛОГИКА BIG O ---

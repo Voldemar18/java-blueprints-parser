@@ -511,35 +511,40 @@
                 const originalCode = source.value;
                 const originalRevision = revision;
 
-                const lines = originalCode.split(/\r\n|\n|\r/);
-                const lineIndex = Number(node.line) - 1;
+                await run('Получаем выражение узла…', async () => {
+                    const info = await api('/api/parse/edit-info', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            code: originalCode,
+                            nodeId: node.id
+                        })
+                    });
 
-                if (!Number.isInteger(lineIndex)
-                        || lineIndex < 0
-                        || lineIndex >= lines.length) {
-                    status('У узла нет корректной строки исходника.', 'error');
-                    return;
-                }
+                    if (revision !== originalRevision ||
+                            source.value !== originalCode) {
+                        status('Исходник изменился. Перестройте граф.');
+                        return;
+                    }
 
-                goToLine(node.line);
+                    const replacement = window.prompt(
+                        `${info.label}\nУзел: ${node.id}`,
+                        info.text
+                    );
 
-                const currentLine = lines[lineIndex];
+                    if (replacement === null ||
+                            replacement.trim() === info.text.trim()) {
+                        status('Изменение отменено.');
+                        return;
+                    }
 
-                const replacement = window.prompt(
-                    `Редактирование всей строки ${node.line}:`,
-                    currentLine.trim()
-                );
+                    if (!replacement.trim()) {
+                        status('Выражение не должно быть пустым.', 'error');
+                        return;
+                    }
 
-                if (replacement === null || replacement === currentLine.trim()) {
-                    return;
-                }
-
-                if (!replacement.trim()) {
-                    status('Новый текст не должен быть пустым.', 'error');
-                    return;
-                }
-
-                await run('Применяем изменение…', async () => {
                     const result = await api('/api/parse/edit', {
                         method: 'POST',
                         headers: {
@@ -552,20 +557,19 @@
                         })
                     });
 
-                    if (revision !== originalRevision
-                            || source.value !== originalCode) {
-                        status(
-                            'Исходник изменился во время запроса. ' +
-                            'Ответ не применён.'
-                        );
+                    if (revision !== originalRevision ||
+                            source.value !== originalCode) {
+                        status('Исходник изменился. Ответ не применён.');
                         return;
                     }
 
-                    if (typeof result.code !== 'string'
-                            || !result.graph
-                            || !Array.isArray(result.graph.nodes)
-                            || !Array.isArray(result.graph.edges)) {
-                        throw new Error('Backend вернул некорректный результат редактирования.');
+                    if (typeof result.code !== 'string' ||
+                            !result.graph ||
+                            !Array.isArray(result.graph.nodes) ||
+                            !Array.isArray(result.graph.edges)) {
+                        throw new Error(
+                            'Некорректный ответ редактирования'
+                        );
                     }
 
                     source.value = result.code;
@@ -574,8 +578,8 @@
                     renderGraph(result.graph);
 
                     status(
-                        'Исходник обновлён, граф перестроен. ' +
-                        'Компиляция и поведение ещё не проверены.',
+                        'Выражение AST изменено, Java сгенерирована, граф перестроен. ' +
+                        'Запустите проверку исходника.',
                         'ok'
                     );
                 });

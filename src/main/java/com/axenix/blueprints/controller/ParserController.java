@@ -42,4 +42,26 @@ public class ParserController {
             return ResponseEntity.badRequest().body(java.util.Map.of("message", e.getMessage()));
         }
     }
+
+    @PostMapping("/edit-info")
+    public ResponseEntity<?> getEditInfo(
+            @RequestBody EditRequest request
+    ) {
+        try {
+            return ResponseEntity.ok(
+                    parserService.getNodeEditInfo(
+                            request.code(),
+                            request.nodeId()
+                    )
+            );
+        } catch (Exception e) {
+            String message = e.getMessage() == null
+                    ? "Не удалось получить данные узла"
+                    : e.getMessage();
+
+            return ResponseEntity.badRequest().body(
+                    java.util.Map.of("message", message)
+            );
+        }
+    }
 }
