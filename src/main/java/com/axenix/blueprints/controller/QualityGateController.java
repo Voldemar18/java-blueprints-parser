@@ -26,7 +26,7 @@ public class QualityGateController {
             @RequestBody String code,
             @RequestParam(
                     value = "testClass",
-                    defaultValue = "TestMonolithTest"
+                    defaultValue = ""
             ) String testClassName
     ) {
         return execute(code, testClassName);
@@ -37,7 +37,7 @@ public class QualityGateController {
             @RequestParam("file") MultipartFile file,
             @RequestParam(
                     value = "testClass",
-                    defaultValue = "TestMonolithTest"
+                    defaultValue = ""
             ) String testClassName
     ) {
         try {
@@ -63,23 +63,9 @@ public class QualityGateController {
     }
 
     private ResponseEntity<QualityGateResponse> execute(
-            String code, String testClassName
+            String code,
+            String testClassName
     ) {
-        if (!"TestMonolithTest".equals(testClassName)) {
-            return ResponseEntity.badRequest().body(
-                    new QualityGateResponse(
-                            false,
-                            "invalid_input",
-                            0,
-                            0,
-                            0,
-                            List.of(),
-                            List.of(),
-                            "Разрешён только TestMonolithTest"
-                    )
-            );
-        }
-
         return ResponseEntity.ok(
                 qualityGateService.check(code, testClassName)
         );

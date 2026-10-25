@@ -107,9 +107,10 @@
         </div>
 
         <div class="note">
-            Сейчас поддерживается только public class TestMonolith без package.
-            Набор: TestMonolithTest, 6 проверок.
-            Успешный результат относится только к выполненным тестам.
+            Проверка одного Java-файла с одним public class.
+            Для класса требуется заранее подготовленный JUnit 4-набор:
+            Имя Класса Test в том же package.
+            Если набора нет, проверка поведения недоступна.
         </div>
 
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;padding:14px">
@@ -723,7 +724,7 @@
                 output.style.color = '';
 
                 const data = await api(
-                    '/api/quality/check?testClass=TestMonolithTest',
+                    '/api/quality/check',
                     {
                         method: 'POST',
                         headers: {

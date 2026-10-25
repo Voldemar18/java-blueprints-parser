@@ -27,42 +27,72 @@ public class QualityGateService {
 
         try {
             if (code == null || code.isBlank()) {
-                return error(started, "invalid_input", "Пустой исходный код");
-            }
-
-
-            if (!"TestMonolithTest".equals(testClassName)) {
                 return error(
                         started,
                         "invalid_input",
-                        "Этот сценарий поддерживает только TestMonolithTest"
+                        "Исходный код не должен быть пустым"
                 );
             }
-
-            Path testFile = Path.of(
-                    "target", "test-classes", "TestMonolithTest.class"
-            ).toAbsolutePath();
-
-            if (!Files.isRegularFile(testFile)) {
-                return error(
-                        started,
-                        "infrastructure_error",
-                        "Нет скомпилированного теста: " + testFile
-                                + ". Выполните mvn test"
-                );
-            }
-
+            
             CompilationUnit unit = StaticJavaParser.parse(code);
 
-            boolean correctClass = unit.getTypes().stream().anyMatch(type ->
-                    type instanceof ClassOrInterfaceDeclaration
-                            && type.getNameAsString().equals("TestMonolith")
-                            && type.isPublic()
-            );
+            var publicClasses = unit.getTypes().stream()
+                    .filter(type -> type instanceof ClassOrInterfaceDeclaration)
+                    .map(type -> (ClassOrInterfaceDeclaration) type)
+                    .filter(type -> type.isPublic() && !type.isInterface())
+                    .toList();
 
-            if (unit.getPackageDeclaration().isPresent() || !correctClass) {
-                return error(started, "invalid_input",
-                        "Нужен полный public class TestMonolith без package");
+            if (publicClasses.size() != 1) {
+                return error(
+                        started,
+                        "invalid_input",
+                        "Нужен один public class верхнего уровня в Java-файле"
+                );
+            }
+
+            String simpleClassName = publicClasses.get(0).getNameAsString();
+
+            String packageName = unit.getPackageDeclaration()
+                    .map(declaration -> declaration.getNameAsString())
+                    .orElse("");
+
+            String candidateClassName = packageName.isEmpty()
+                    ? simpleClassName
+                    : packageName + "." + simpleClassName;
+
+            String expectedTestClassName = candidateClassName + "Test";
+
+            String resolvedTestClassName =
+                    testClassName == null || testClassName.isBlank()
+                            ? expectedTestClassName
+                            : testClassName.trim();
+
+            if (!resolvedTestClassName.equals(expectedTestClassName)) {
+                return error(
+                        started,
+                        "invalid_input",
+                        "Для класса " + candidateClassName
+                                + " ожидается набор " + expectedTestClassName
+                );
+            }
+
+            Path testRoot = Path.of("target", "test-classes")
+                    .toAbsolutePath()
+                    .normalize();
+
+            Path testFile = testRoot.resolve(
+                    resolvedTestClassName.replace('.', '/') + ".class"
+            ).normalize();
+
+            if (!testFile.startsWith(testRoot)
+                    || !Files.isRegularFile(testFile)) {
+                return error(
+                        started,
+                        "tests_not_found",
+                        "Не найден набор " + resolvedTestClassName
+                                + ". Добавьте соответствующий JUnit 4-тест "
+                                + "в src/test/java и выполните mvn test"
+                );
             }
 
             JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
@@ -73,7 +103,7 @@ public class QualityGateService {
             }
 
             directory = Files.createTempDirectory("blueprints-quality-");
-            Path source = directory.resolve("TestMonolith.java");
+            Path source = directory.resolve(simpleClassName + ".java");
             Path reportFile = directory.resolve("report.properties");
             Path processLog = directory.resolve("process.log");
 
@@ -140,7 +170,6 @@ public class QualityGateService {
                     System.getProperty("java.home"), "bin", executable
             );
 
-            // Кандидат ПЕРВЫМ: тесты должны обращаться к новой версии.
             String childClasspath =
                     directory.toAbsolutePath() + File.pathSeparator + classpath;
 
@@ -149,9 +178,10 @@ public class QualityGateService {
                     "-Xmx256m",
                     "-cp", childClasspath,
                     QualityGateRunner.class.getName(),
-                    testClassName,
+                    resolvedTestClassName,
                     directory.toAbsolutePath().toString(),
-                    reportFile.toAbsolutePath().toString()
+                    reportFile.toAbsolutePath().toString(),
+                    candidateClassName
             );
 
             builder.redirectErrorStream(true);

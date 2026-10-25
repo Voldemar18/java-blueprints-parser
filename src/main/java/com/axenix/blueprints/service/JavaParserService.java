@@ -83,6 +83,10 @@ public class JavaParserService {
             return statement.getCondition();
         }
 
+        if (target instanceof DoStmt statement) {
+            return statement.getCondition();
+        }
+
         if (target instanceof ForStmt statement) {
             return statement.getCompare().orElseThrow(
                     () -> new IllegalArgumentException(
@@ -116,6 +120,9 @@ public class JavaParserService {
         }
         if (target instanceof WhileStmt) {
             return "Условие while — только выражение";
+        }
+        if (target instanceof DoStmt) {
+            return "Условие do-while — только выражение";
         }
         if (target instanceof ForStmt) {
             return "Условие for — только выражение сравнения";
